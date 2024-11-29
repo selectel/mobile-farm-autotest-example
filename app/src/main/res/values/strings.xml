@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Autotest Example</string>
+    <string name="button_text">Click me</string>
+    <string name="counter_value">0</string>
+</resources>

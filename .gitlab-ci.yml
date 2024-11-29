@@ -1,0 +1,167 @@
+stages:
+  - install
+  - setup
+  - test
+  - cleanup
+
+variables:
+  SELECTEL_AUTH_TOKENS_URL: "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+  SELECTEL_MOBILE_FARM_API_URL: "https://api.selectel.ru/mobfarm/api"
+
+default:
+  image: thyrlian/android-sdk:10.0
+  before_script:
+    - apt-get update && apt-get install -y curl jq
+    - sdkmanager --update
+    - sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" "cmdline-tools;latest"
+
+cache:
+  paths:
+    - .gradle/caches
+    - .gradle/wrapper
+
+setup-environment:
+  stage: setup
+  script:
+    # Obtain an authorization token
+    - |
+      response=$(curl -s -D - -X POST \
+        --header 'Content-Type: application/json' \
+        --data-raw '{
+          "auth": {
+            "identity": {
+              "methods": ["password"],
+              "password": {
+                "user": {
+                  "name": "'"$USER_NAME"'",
+                  "domain": { "name": "'"$ACCOUNT_NAME"'" },
+                  "password": "'"$PASSWORD"'"
+                }
+              }
+            },
+            "scope": {
+              "project": {
+                "name": "'"$PROJECT_NAME"'",
+                "domain": { "name": "'"$ACCOUNT_NAME"'" }
+              }
+            }
+          }
+        }' \
+        $SELECTEL_AUTH_TOKENS_URL)
+
+    # Extract the X-Auth-Token from the response X-Subject-Token header
+    - token=$(echo "$response" | grep -i "^x-subject-token" | awk '{print $2}' | tr -d '\r')
+    - export X_AUTH_TOKEN=$token
+
+    # Pass X-Auth-Token to the following job
+    - echo "X_AUTH_TOKEN=$token" >> .env
+
+    # Generate ADB key-pair
+    - mkdir -p ~/.android
+    - adb keygen ~/.android/adbkey
+    - adb pubkey ~/.android/adbkey > ~/.android/adbkey.pub
+
+    # Copy the keys to the project directory for artifacts
+    - mkdir -p adb-keys
+    - cp ~/.android/adbkey adb-keys/
+    - cp ~/.android/adbkey.pub adb-keys/
+
+    # Store adb public key at Mobile farm
+    - adb_pub_key=$(cat ~/.android/adbkey.pub)
+    - |
+      curl --location "$SELECTEL_MOBILE_FARM_API_URL/v2/keys/adb" \
+        --header "Content-Type: application/json" \
+        --header "X-Auth-Token: $X_AUTH_TOKEN" \
+        --data "$(jq -n --arg title "$CI_PIPELINE_ID" --arg pubKey "$adb_pub_key" \
+          '{"title": $title, "publicKey": $pubKey}')" \
+        > response.json
+    - fingerprint=$(cat response.json | jq -r '.publicKey.fingerprint')
+    - export FINGERPRINT=$fingerprint
+    - echo "ADB key with fingerprint $FINGERPRINT successfully stored in Mobile farm"
+
+    # Pass fingerprint to the following job
+    - echo "FINGERPRINT=$fingerprint" >> .env
+  artifacts:
+    paths:
+      - adb-keys/
+    reports:
+      dotenv: .env
+
+setup-device:
+  stage: setup
+  needs: ["setup-environment"]
+  dependencies:
+    - setup-environment
+  script:
+    # Assign device to a user
+    - |
+      curl --location --request POST "$SELECTEL_MOBILE_FARM_API_URL/v1/user/devices" \
+        --header "Accept: application/json" \
+        --header "X-Auth-Token: $X_AUTH_TOKEN" \
+        --header "Content-Type: application/json" \
+        --data '{"serial": "'$DEVICE_SERIAL'", "timeout": 300000}'
+
+    # Start remote ADB connection on server side
+    - |
+      curl --location --request POST "$SELECTEL_MOBILE_FARM_API_URL/v1/user/devices/$DEVICE_SERIAL/remoteConnect" \
+        --header "Accept: application/json" \
+        --header "X-Auth-Token: $X_AUTH_TOKEN" \
+        --output response_body.txt
+
+    # Save remote connect URL as env variable
+    - remote_connect_url=$(cat response_body.txt | jq -r '.remoteConnectUrl // ""')
+    - echo "Remote URL is $remote_connect_url"
+    - export UDID=$remote_connect_url
+    - echo "Obtained uniques device identifier to connect with value $UDID"
+
+    # Pass unique device identifier to the following job
+    - echo "UDID=$UDID" >> .env
+
+    - echo "Device setup completed"
+  artifacts:
+    reports:
+      dotenv: .env
+
+run-tests:
+  stage: test
+  needs:
+    - setup-device
+    - setup-environment
+  dependencies:
+    - setup-environment
+    - setup-device
+  script:
+    # Restore ADB key pair
+    - mkdir -p ~/.android
+    - cp adb-keys/adbkey ~/.android/adbkey
+    - cp adb-keys/adbkey.pub ~/.android/adbkey.pub
+
+    # Connect to ADB and ensure device is available
+    - adb connect $UDID
+    - sleep 1
+    - adb devices
+
+    # Run tests
+    - ./gradlew connectedAndroidTest
+
+cleanup:
+  needs:
+    - setup-device
+    - setup-environment
+    - run-tests
+  dependencies:
+    - setup-environment
+    - setup-device
+  stage: cleanup
+  script:
+    # Release user device
+    - |
+      curl --location --request DELETE "$SELECTEL_MOBILE_FARM_API_URL/v1/user/devices/$DEVICE_SERIAL" \
+        --header "Accept: application/json" \
+        --header "X-Auth-Token: $X_AUTH_TOKEN"
+
+    # Remove ADB key from Mobile farm
+    - |
+      curl --location --request DELETE "$SELECTEL_MOBILE_FARM_API_URL/v2/keys/adb/$FINGERPRINT" \
+        --header "Accept: application/json" \
+        --header "X-Auth-Token: $X_AUTH_TOKEN"

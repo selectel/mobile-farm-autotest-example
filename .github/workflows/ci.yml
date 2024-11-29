@@ -1,0 +1,196 @@
+name: Android CI Example Workflow
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  SELECTEL_AUTH_TOKENS_URL: "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+  SELECTEL_MOBILE_FARM_API_URL: "https://api.selectel.ru/mobfarm/api"
+  USER_NAME: ${{ secrets.USER_NAME }}
+  PASSWORD: ${{ secrets.PASSWORD }}
+  PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+  ACCOUNT_NAME: ${{ secrets.ACCOUNT_NAME }}
+  DEVICE_SERIAL: ${{ secrets.DEVICE_SERIAL }}
+
+jobs:
+  run-autotests:
+    runs-on: ubuntu-latest
+    container:
+      image: thyrlian/android-sdk:10.0 # Prebuilt Android SDK Docker image
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y curl jq
+
+      - name: Update Android SDK
+        run: |
+          sdkmanager --update  # Update the SDK to ensure the latest tools are available
+          sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" "cmdline-tools;latest"  # Install required SDK components
+
+      - name: Install Gradle dependencies
+        run: ./gradlew dependencies
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Obtain Authorization Token
+        run: |
+          response=$(curl -s -D - -X POST \
+            --header 'Content-Type: application/json' \
+            --data-raw '{
+              "auth": {
+                "identity": {
+                  "methods": ["password"],
+                  "password": {
+                    "user": {
+                      "name": "${{ env.USER_NAME }}",
+                      "domain": { "name": "${{ env.ACCOUNT_NAME }}" },
+                      "password": "${{ env.PASSWORD }}"
+                    }
+                  }
+                },
+                "scope": {
+                  "project": {
+                    "name": "${{ env.PROJECT_NAME }}",
+                    "domain": { "name": "${{ env.ACCOUNT_NAME }}" }
+                  }
+                }
+              }
+            }' \
+            $SELECTEL_AUTH_TOKENS_URL)
+          token=$(echo "$response" | grep -i "^x-subject-token" | awk '{print $2}' | tr -d '\r')
+          
+          # Check if token is successfully obtained
+          if [ -z "$token" ]; then
+            echo "Error: unable to obtain X-Auth-Token."
+            exit 1
+          fi
+          
+          echo "Successfully obtained X-Auth-Token."
+          
+          # Save the token for future steps
+          echo "X_AUTH_TOKEN=$token" >> .env  
+
+      - name: Generate ADB Key Pair
+        run: |
+          # Create the default .android directory for storing ADB keys
+          mkdir -p ~/.android  
+
+          # Generate a new ADB key
+          adb keygen ~/.android/adbkey  
+
+          # Extract the public key
+          adb pubkey ~/.android/adbkey > ~/.android/adbkey.pub
+
+      - name: Store ADB Key in Mobile Farm
+        shell: bash
+        run: |
+          source .env
+          
+          # Get the generated ADB public key
+          adb_pub_key=$(cat ~/.android/adbkey.pub)
+          
+          # Send the ADB public key to the Mobile Farm API
+          curl --location "$SELECTEL_MOBILE_FARM_API_URL/v2/keys/adb" \
+            --header "Content-Type: application/json" \
+            --header "X-Auth-Token: $X_AUTH_TOKEN" \
+            --data "$(jq -n --arg title "$GITHUB_RUN_ID" --arg pubKey "$adb_pub_key" \
+              '{"title": $title, "publicKey": $pubKey}')" \
+            > response.json
+          
+          # Extract fingerprint from the response
+          fingerprint=$(cat response.json | jq -r '.publicKey.fingerprint')
+          
+          # Check if key was successfully stored
+          if [ -z "$fingerprint" ]; then
+            echo "Error: ADB key was not successfully stored."
+            exit 1
+          fi
+          
+          echo "Successfully stored ADB key."
+          
+          # Save the fingerprint for future use
+          echo "FINGERPRINT=$fingerprint" >> $GITHUB_ENV
+
+      - name: Assign Device
+        shell: bash
+        run: |
+          source .env
+          
+          # Assign device from the Mobile Farm
+          curl --location --request POST "$SELECTEL_MOBILE_FARM_API_URL/v1/user/devices" \
+            --header "Accept: application/json" \
+            --header "X-Auth-Token: $X_AUTH_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data '{"serial": "${{ env.DEVICE_SERIAL }}", "timeout": 300000}'
+
+      - name: Start Remote ADB Connection
+        shell: bash
+        run: |
+          source .env
+          
+          # Start remote ADB connection for the device
+          curl --location --request POST "$SELECTEL_MOBILE_FARM_API_URL/v1/user/devices/${{ env.DEVICE_SERIAL }}/remoteConnect" \
+            --header "Accept: application/json" \
+            --header "X-Auth-Token: $X_AUTH_TOKEN" \
+            --output response_body.txt
+          
+          # Extract remote connect URL
+          remote_connect_url=$(cat response_body.txt | jq -r '.remoteConnectUrl // ""')
+          
+          # Check if remote connection URL was returned
+          if [ -z "$remote_connect_url" ]; then
+            echo "Error: unable to start remote ADB connect session."
+            exit 1
+          fi
+          
+          echo "Successfully started remote ADB connect session."
+
+          # Save the unique device identifier (UDID) for future steps
+          echo "UDID=$remote_connect_url" >> $GITHUB_ENV
+
+      - name: Connect to ADB
+        run: |
+          # Connect to the remote device via ADB
+          adb connect ${{ env.UDID }}
+
+          # Wait for the connection to stabilize
+          sleep 1
+
+          # Verify the device connection
+          adb devices
+
+          echo "Device is ready"
+
+      - name: Run Tests
+        run: ./gradlew connectedAndroidTest
+
+      - name: Release Device
+        # Ensure this step runs even if previous steps fail
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          source .env
+          # Release the device after testing
+          curl --location --request DELETE "$SELECTEL_MOBILE_FARM_API_URL/v1/user/devices/${{ env.DEVICE_SERIAL }}" \
+            --header "Accept: application/json" \
+            --header "X-Auth-Token: $X_AUTH_TOKEN"
+
+      - name: Remove ADB Key
+        # Run if ADB key was generated and stored
+        if: ${{ always() && env.FINGERPRINT != null && env.FINGERPRINT != '' }}
+        shell: bash
+        run: |
+          source .env
+          # Remove the ADB key from Mobile Farm after testing
+          curl --location --request DELETE "$SELECTEL_MOBILE_FARM_API_URL/v2/keys/adb/${{ env.FINGERPRINT }}" \
+            --header "Accept: application/json" \
+            --header "X-Auth-Token: $X_AUTH_TOKEN"
