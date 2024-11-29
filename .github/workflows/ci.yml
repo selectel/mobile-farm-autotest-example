@@ -171,7 +171,9 @@ jobs:
           echo "Device is ready"
 
       - name: Run Tests
-        run: ./gradlew connectedAndroidTest -Dadb.install.timeout=300
+        run: |
+          export ADB_INSTALL_TIMEOUT=5
+          ./gradlew connectedAndroidTest
 
       - name: Release Device
         # Ensure this step runs even if previous steps fail
