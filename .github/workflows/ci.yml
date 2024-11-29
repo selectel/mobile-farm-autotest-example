@@ -173,7 +173,7 @@ jobs:
       - name: Run Tests
         run: |
           export ADB_INSTALL_TIMEOUT=5
-          ./gradlew connectedAndroidTest --info --stackTrace
+          ./gradlew connectedAndroidTest --info
 
       - name: Release Device
         # Ensure this step runs even if previous steps fail
